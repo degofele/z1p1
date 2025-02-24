@@ -1,97 +1,74 @@
-from flask import Flask, request, redirect, url_for, render_template
+from flask import Flask, render_template, request, redirect, url_for
 import os
 import pandas as pd
-import csv
+import sqlite3  # Или psycopg2 для PostgreSQL
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
-app.config['DATABASE_FILE'] = 'database.csv'
+app.config['DATABASE'] = 'database.db'  # SQLite
+# app.config['DATABASE'] = 'postgresql://user:password@host:port/database' # PostgreSQL
 app.config['SECRET_KEY'] = 'your_secret_key'
 
-# Создаем папку uploads, если ее нет
-if not os.path.exists(app.config['UPLOAD_FOLDER']):
-    os.makedirs(app.config['UPLOAD_FOLDER'])
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-# Создаем файл базы данных, если его нет (с заголовком)
-if not os.path.exists(app.config['DATABASE_FILE']):
-    with open(app.config['DATABASE_FILE'], 'w', newline='') as csvfile:
-        writer = csv.writer(csvfile)
-        writer.writerow(['filename', 'data'])  # Заголовок файла
 
-# Функция для сохранения данных из Excel в CSV-файл
-def save_excel_to_csv(file_path, filename):
-    print("Функция save_excel_to_csv вызвана")
-    try:
-        df = pd.read_excel(file_path)
-        print("Файл Excel успешно прочитан")
-        data_list = df.to_dict(orient='records')
+def get_db_connection():
+    conn = sqlite3.connect(app.config['DATABASE'])  # SQLite
+    # Или:
+    # conn = psycopg2.connect(app.config['DATABASE']) # PostgreSQL
+    conn.row_factory = sqlite3.Row # Или psycopg2.extras.DictCursor
+    return conn
 
-        with open(app.config['DATABASE_FILE'], 'a', newline='') as csvfile:
-            writer = csv.writer(csvfile)
-            for row in data_list:
-                import json
-                data_string = json.dumps(row)
-                writer.writerow([filename, data_string])
-        print("Данные успешно записаны в CSV")
-        return True
-    except Exception as e:
-        print(f"Ошибка при сохранении в CSV: {e}")
-        return False
+
+def init_db():
+    conn = get_db_connection()
+    with open('schema.sql') as f:  # Создайте файл schema.sql (см. ниже)
+        conn.executescript(f.read())
+    conn.close()
+
 
 @app.route('/', methods=['GET', 'POST'])
-def index():
+def upload_file():
     if request.method == 'POST':
-        if 'excel_file' not in request.files:
-            print("Ошибка: Файл не выбран (отсутствует в request.files)")
-            return render_template('index.html', error='Файл не выбран')
-
         file = request.files['excel_file']
-        print(f"Имя файла: {file.filename}")
-        if file.filename == '':
-            print("Ошибка: Файл не выбран (имя файла пустое)")
-            return render_template('index.html', error='Файл не выбран')
-
         if file:
             filename = file.filename
-            file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-            print(f"Путь сохранения файла: {file_path}")
-            file.save(file_path)
-            print(f"Файл сохранен.")
+            filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            file.save(filepath)
+            process_excel(filepath)
+            return redirect(url_for('view_data'))
+    return render_template('upload.html')
 
-            if save_excel_to_csv(file_path, filename):
-                return redirect(url_for('view_data'))
-            else:
-                return render_template('index.html', error='Ошибка при сохранении в базу данных')
 
-    return render_template('index.html')
+def process_excel(filepath):
+    try:
+        df = pd.read_excel(filepath)
+        column_names = list(df.columns)
+        num_rows = len(df)
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        for column_name in column_names:
+            cursor.execute("INSERT INTO columns (name) VALUES (?)", (column_name,))
+        conn.commit()
+        conn.close()
+
+        print(f"Столбцы сохранены в БД: {column_names}")
+        print(f"Количество строк: {num_rows}")
+    except Exception as e:
+        print(f"Ошибка обработки Excel: {e}")
+
+
 
 @app.route('/view_data')
 def view_data():
-    data = []
-    column_names = set()
-    try:
-        with open(app.config['DATABASE_FILE'], 'r', newline='') as csvfile:
-            reader = csv.reader(csvfile)
-            next(reader, None)  # Пропускаем заголовок
-            for row in reader:
-                filename = row[0]
-                data_string = row[1]
-                import json
-                try:
-                    data_dict = json.loads(data_string)
-                    data.append(data_dict)
-                    column_names.update(data_dict.keys())
-                except (json.JSONDecodeError, TypeError) as e:
-                    print(f"Ошибка при декодировании JSON: {e}")
-                    continue
+    conn = get_db_connection()
+    columns = conn.execute("SELECT * FROM columns").fetchall()
+    conn.close()
+    return render_template('view_data.html', columns=columns)
 
-    except FileNotFoundError:
-        print("Файл базы данных не найден.")
-
-    print(f"Данные прочитаны из CSV: {data}")
-    column_names = list(column_names)
-    print(f"Имена столбцов: {column_names}")
-    return render_template('view_data.html', data=data, column_names=column_names)
 
 if __name__ == '__main__':
+    with app.app_context():  # Для создания БД вне запроса
+        init_db()
     app.run(debug=True)
